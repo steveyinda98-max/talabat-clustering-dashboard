@@ -1,455 +1,303 @@
-import streamlit as st
-import pandas as pd
+
+import os
+from pathlib import Path
+import joblib
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.mixture import GaussianMixture
-from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+APP_TITLE = "Talabat Delivery Intelligence Dashboard"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "models"
+DATA_DIR = BASE_DIR / "data"
 
-# Optional geopy. Kalau tidak ada koordinat lengkap, app tetap bisa jalan.
-try:
-    from geopy.distance import geodesic
-except Exception:
-    geodesic = None
-
-st.set_page_config(
-    page_title="Talabat Delivery Clustering Dashboard",
-    layout="wide"
-)
-
-st.title("Talabat Delivery Clustering & Dataset Limitation Dashboard")
-st.write(
-    "Dashboard ini digunakan untuk menampilkan hasil clustering terbaik, membandingkan model, "
-    "dan menjelaskan limitasi dataset berdasarkan hasil evaluasi."
-)
+st.set_page_config(page_title=APP_TITLE, page_icon="🛵", layout="wide")
 
 # =========================
-# Helper Functions
+# Custom CSS - Talabat theme
 # =========================
-
-def safe_mode(series):
-    mode_val = series.mode(dropna=True)
-    if len(mode_val) > 0:
-        return mode_val.iloc[0]
-    return np.nan
-
-
-def calculate_total_delivery_route(df):
-    required_cols = [
-        "Driver_Lat", "Driver_Lon",
-        "Restaurant_Lat", "Restaurant_Lon",
-        "Customer_Lat", "Customer_Lon"
-    ]
-
-    if "Total_Delivery_Route" in df.columns:
-        return df
-
-    if all(col in df.columns for col in required_cols) and geodesic is not None:
-        df["Driver_Point"] = list(zip(df["Driver_Lat"], df["Driver_Lon"]))
-        df["Restaurant_Point"] = list(zip(df["Restaurant_Lat"], df["Restaurant_Lon"]))
-        df["Customer_Point"] = list(zip(df["Customer_Lat"], df["Customer_Lon"]))
-
-        df["Driver_Restaurant_Distance"] = df.apply(
-            lambda row: geodesic(row["Driver_Point"], row["Restaurant_Point"]).km,
-            axis=1
-        )
-
-        df["Restaurant_Customer_Distance"] = df.apply(
-            lambda row: geodesic(row["Restaurant_Point"], row["Customer_Point"]).km,
-            axis=1
-        )
-
-        df["Total_Delivery_Route"] = (
-            df["Driver_Restaurant_Distance"] + df["Restaurant_Customer_Distance"]
-        )
-
-    elif "Delivery_Distance_km" in df.columns:
-        df["Total_Delivery_Route"] = df["Delivery_Distance_km"]
-
-    return df
-
-
-def preprocess_data(df):
-    df = df.copy()
-
-    # Convert datetime columns if available
-    if "Order_Time" in df.columns:
-        df["Order_Time"] = pd.to_datetime(df["Order_Time"], errors="coerce")
-        df["Order_Hour"] = df["Order_Time"].dt.hour
-        df["Order_Month"] = df["Order_Time"].dt.month
-        df["Order_Year"] = df["Order_Time"].dt.year
-
-        df["Order_Period"] = pd.cut(
-            df["Order_Hour"],
-            bins=[0, 6, 12, 18, 24],
-            labels=["Night", "Morning", "Afternoon", "Evening"],
-            include_lowest=True
-        )
-
-    if "Delivery_Time" in df.columns:
-        df["Delivery_Time"] = pd.to_datetime(df["Delivery_Time"], errors="coerce")
-        df["Delivery_Hour"] = df["Delivery_Time"].dt.hour
-
-    # Create category columns for profiling
-    if "Total_Price" in df.columns and "Price_Level" not in df.columns:
-        try:
-            df["Price_Level"] = pd.qcut(
-                df["Total_Price"],
-                q=4,
-                labels=["Low Price", "Medium Price", "High Price", "Very High Price"],
-                duplicates="drop"
-            )
-        except Exception:
-            df["Price_Level"] = "Unknown"
-
-    if "Quantity" in df.columns and "Quantity_Level" not in df.columns:
-        df["Quantity_Level"] = pd.cut(
-            df["Quantity"],
-            bins=[0, 2, 4, np.inf],
-            labels=["Small Order", "Medium Order", "Large Order"],
-            include_lowest=True
-        )
-
-    # Encoding categorical columns
-    traffic_map = {"Low": 0, "Medium": 1, "High": 2}
-    vehicle_map = {"Bicycle": 0, "Motorbike": 1, "Car": 2}
-    payment_map = {"Cash": 0, "Credit Card": 1, "Wallet": 2}
-
-    if "Traffic_Level" in df.columns and "Traffic_Level_Encoded" not in df.columns:
-        df["Traffic_Level_Encoded"] = df["Traffic_Level"].map(traffic_map)
-
-    if "Driver_Vehicle" in df.columns and "Driver_Vehicle_Encoded" not in df.columns:
-        df["Driver_Vehicle_Encoded"] = df["Driver_Vehicle"].map(vehicle_map)
-
-    if "Payment_Method" in df.columns and "Payment_Method_Encoded" not in df.columns:
-        df["Payment_Method_Encoded"] = df["Payment_Method"].map(payment_map)
-
-    if "City" in df.columns and "City_Encoded" not in df.columns:
-        df["City_Encoded"] = df["City"].astype("category").cat.codes
-
-    # Standardized columns needed by notebook
-    standard_cols = [
-        "Quantity", "Total_Price", "Delivery_Duration_Minutes",
-        "Delivery_Distance_km", "Order_Hour", "Delivery_Hour"
-    ]
-
-    for col in standard_cols:
-        std_col = f"{col}_std"
-        if col in df.columns and std_col not in df.columns:
-            if df[col].std() == 0 or pd.isna(df[col].std()):
-                df[std_col] = 0
-            else:
-                df[std_col] = (df[col] - df[col].mean()) / df[col].std()
-
-    df = calculate_total_delivery_route(df)
-
-    return df
-
-
-def evaluate_clustering(X, labels):
-    labels = np.array(labels)
-    unique_labels = set(labels)
-
-    if len(unique_labels) <= 1:
-        return None, None, None
-
-    return (
-        silhouette_score(X, labels),
-        davies_bouldin_score(X, labels),
-        calinski_harabasz_score(X, labels)
-    )
-
-
-def build_clustering(df, analysis_type):
-    if analysis_type == "Customer Segmentation":
-        features = [
-            "Total_Price_std",
-            "Quantity_std",
-            "Order_Hour_std",
-            "Payment_Method_Encoded",
-            "Traffic_Level_Encoded",
-            "Total_Delivery_Route"
-        ]
-        profile_cols = {
-            "Price_Level": safe_mode,
-            "Quantity_Level": safe_mode,
-            "Order_Period": safe_mode,
-            "Payment_Method": safe_mode,
-            "Total_Price": "mean"
-        }
-        final_col = "Customer_Cluster"
-        title = "Customer Segmentation"
-
-    else:
-        features = [
-            "Delivery_Duration_Minutes_std",
-            "Total_Delivery_Route",
-            "Traffic_Level_Encoded",
-            "Driver_Vehicle_Encoded",
-            "Delivery_Hour_std"
-        ]
-        profile_cols = {
-            "Delivery_Duration_Minutes": "mean",
-            "Total_Delivery_Route": "mean",
-            "Traffic_Level": safe_mode,
-            "Driver_Vehicle": safe_mode,
-            "Delivery_Hour": "mean"
-        }
-        final_col = "Performance_Cluster"
-        title = "Delivery Performance"
-
-    missing_features = [col for col in features if col not in df.columns]
-    if missing_features:
-        st.error(f"Kolom berikut belum ada di dataset: {missing_features}")
-        st.stop()
-
-    working_df = df.dropna(subset=features).copy()
-    X = working_df[features]
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    pca = PCA(n_components=2)
-    X_pca = pca.fit_transform(X_scaled)
-
-    # K-Means as final selected model
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    working_df["KMeans_Cluster"] = kmeans.fit_predict(X_pca)
-
-    # DBSCAN as comparison only
-    dbscan = DBSCAN(eps=0.35, min_samples=10)
-    working_df["DBSCAN_Cluster"] = dbscan.fit_predict(X_pca)
-
-    # GMM as comparison only
-    gmm = GaussianMixture(n_components=4, random_state=42)
-    working_df["GMM_Cluster"] = gmm.fit_predict(X_pca)
-
-    # Evaluation
-    sil_kmeans, dbi_kmeans, ch_kmeans = evaluate_clustering(X_pca, working_df["KMeans_Cluster"])
-
-    dbscan_mask = working_df["DBSCAN_Cluster"] != -1
-    if dbscan_mask.sum() > 0 and len(set(working_df.loc[dbscan_mask, "DBSCAN_Cluster"])) > 1:
-        sil_dbscan, dbi_dbscan, ch_dbscan = evaluate_clustering(
-            X_pca[dbscan_mask],
-            working_df.loc[dbscan_mask, "DBSCAN_Cluster"]
-        )
-    else:
-        sil_dbscan, dbi_dbscan, ch_dbscan = None, None, None
-
-    sil_gmm, dbi_gmm, ch_gmm = evaluate_clustering(X_pca, working_df["GMM_Cluster"])
-
-    evaluation_df = pd.DataFrame({
-        "Model": ["K-Means", "DBSCAN", "GMM"],
-        "Silhouette Score": [sil_kmeans, sil_dbscan, sil_gmm],
-        "Davies-Bouldin Index": [dbi_kmeans, dbi_dbscan, dbi_gmm],
-        "Calinski-Harabasz Score": [ch_kmeans, ch_dbscan, ch_gmm]
-    })
-
-    working_df[final_col] = working_df["KMeans_Cluster"]
-
-    # Cluster profiling
-    available_profile_cols = {
-        col: agg for col, agg in profile_cols.items() if col in working_df.columns
-    }
-
-    if available_profile_cols:
-        profile_df = working_df.groupby(final_col).agg(available_profile_cols).reset_index()
-    else:
-        profile_df = working_df[[final_col]].value_counts().reset_index()
-
-    return {
-        "df": working_df,
-        "features": features,
-        "X_pca": X_pca,
-        "pca": pca,
-        "kmeans": kmeans,
-        "evaluation_df": evaluation_df,
-        "profile_df": profile_df,
-        "final_col": final_col,
-        "title": title
-    }
-
-
-def plot_cluster(X_pca, labels, centroids, title):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    scatter = ax.scatter(
-        X_pca[:, 0],
-        X_pca[:, 1],
-        c=labels,
-        alpha=0.65
-    )
-    ax.scatter(
-        centroids[:, 0],
-        centroids[:, 1],
-        marker="X",
-        s=220,
-        label="Centroids"
-    )
-
-    for i, centroid in enumerate(centroids):
-        ax.text(
-            centroid[0],
-            centroid[1],
-            f"Cluster {i}",
-            fontsize=10,
-            fontweight="bold"
-        )
-
-    ax.set_title(title)
-    ax.set_xlabel("PCA 1")
-    ax.set_ylabel("PCA 2")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    fig.colorbar(scatter, ax=ax)
-    return fig
-
-
-def limitation_text(evaluation_df, pca):
-    kmeans_row = evaluation_df[evaluation_df["Model"] == "K-Means"].iloc[0]
-    silhouette = kmeans_row["Silhouette Score"]
-    total_variance = pca.explained_variance_ratio_.sum()
-
-    notes = []
-
-    if silhouette < 0.5:
-        notes.append(
-            "Silhouette Score masih di bawah 0.50, sehingga pemisahan antar cluster belum terlalu kuat."
-        )
-    else:
-        notes.append(
-            "Silhouette Score cukup baik, tetapi cluster tetap perlu dibaca sebagai segmentasi analitis, bukan kelompok yang sempurna."
-        )
-
-    if total_variance < 0.6:
-        notes.append(
-            f"Total explained variance PCA 2D hanya sekitar {total_variance:.2%}, sehingga visualisasi 2D belum mewakili seluruh informasi data asli."
-        )
-
-    notes.append(
-        "Hasil clustering menunjukkan pola umum, tetapi masih terdapat kemungkinan overlap karena fitur operasional penting seperti cuaca, waktu persiapan restoran, detail traffic, dan ketersediaan driver tidak tersedia."
-    )
-
-    notes.append(
-        "Karena itu, hasil dashboard lebih tepat digunakan untuk eksplorasi segmentasi dan evaluasi limitasi dataset, bukan untuk keputusan otomatis penuh."
-    )
-
-    return notes
-
-# =========================
-# Sidebar
-# =========================
-
-st.sidebar.header("Input Data")
-uploaded_file = st.sidebar.file_uploader("Upload dataset CSV", type=["csv"])
-
-analysis_type = st.sidebar.selectbox(
-    "Pilih analisis clustering",
-    ["Customer Segmentation", "Delivery Performance"]
-)
-
-st.sidebar.info(
-    "Model final yang digunakan adalah K-Means karena pada notebook K-Means memiliki hasil paling stabil dibanding DBSCAN dan GMM."
-)
-
-# =========================
-# Main App
-# =========================
-
-if uploaded_file is None:
-    st.warning("Upload file dataset CSV terlebih dahulu untuk menjalankan dashboard.")
-    st.write("Kolom penting yang dibutuhkan:")
-    st.code(
-        """
-Customer Segmentation:
-- Total_Price
-- Quantity
-- Order_Time
-- Payment_Method
-- Traffic_Level
-- koordinat / Delivery_Distance_km
-
-Delivery Performance:
-- Delivery_Duration_Minutes
-- Delivery_Time
-- Traffic_Level
-- Driver_Vehicle
-- koordinat / Delivery_Distance_km
-        """
-    )
-    st.stop()
-
-raw_df = pd.read_csv(uploaded_file)
-st.subheader("1. Dataset Preview")
-st.dataframe(raw_df.head())
-
-processed_df = preprocess_data(raw_df)
-result = build_clustering(processed_df, analysis_type)
-
-clustered_df = result["df"]
-evaluation_df = result["evaluation_df"]
-profile_df = result["profile_df"]
-final_col = result["final_col"]
-
-st.subheader("2. Selected Final Model")
-st.success("Final model: K-Means Clustering dengan 4 cluster")
-st.write(
-    "DBSCAN dan GMM tetap dihitung sebagai pembanding, tetapi hasil final menggunakan K-Means karena lebih stabil dan mudah diinterpretasikan."
-)
-
-col1, col2, col3 = st.columns(3)
-kmeans_eval = evaluation_df[evaluation_df["Model"] == "K-Means"].iloc[0]
-col1.metric("Silhouette Score", f"{kmeans_eval['Silhouette Score']:.4f}")
-col2.metric("Davies-Bouldin Index", f"{kmeans_eval['Davies-Bouldin Index']:.4f}")
-col3.metric("Calinski-Harabasz Score", f"{kmeans_eval['Calinski-Harabasz Score']:.2f}")
-
-st.subheader("3. Model Evaluation Comparison")
-st.dataframe(evaluation_df)
-
-st.subheader("4. PCA Cluster Visualization")
-fig = plot_cluster(
-    result["X_pca"],
-    clustered_df[final_col],
-    result["kmeans"].cluster_centers_,
-    f"K-Means {result['title']} Clustering"
-)
-st.pyplot(fig)
-
-st.subheader("5. Cluster Profile")
-st.dataframe(profile_df)
-
-st.subheader("6. Cluster Distribution")
-distribution_df = clustered_df[final_col].value_counts().sort_index().reset_index()
-distribution_df.columns = ["Cluster", "Total Data"]
-st.dataframe(distribution_df)
-
-fig2, ax2 = plt.subplots(figsize=(7, 4))
-ax2.bar(distribution_df["Cluster"].astype(str), distribution_df["Total Data"])
-ax2.set_title("Cluster Distribution")
-ax2.set_xlabel("Cluster")
-ax2.set_ylabel("Total Data")
-ax2.grid(alpha=0.3)
-st.pyplot(fig2)
-
-st.subheader("7. PCA Explained Variance")
-pca_df = pd.DataFrame({
-    "PCA Component": ["PCA 1", "PCA 2"],
-    "Explained Variance Ratio": result["pca"].explained_variance_ratio_
+st.markdown("""
+<style>
+:root { --talabat-orange:#ff5a00; --dark:#111111; --soft:#fff7f2; --muted:#666; }
+.stApp { background: linear-gradient(135deg,#fff 0%,#fff7f2 45%,#ffffff 100%); }
+.block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+[data-testid="stSidebar"] { background: #111111; }
+[data-testid="stSidebar"] * { color: white !important; }
+.hero {
+    padding: 28px; border-radius: 28px; color: white;
+    background: radial-gradient(circle at top right, #ff944d, #ff5a00 45%, #111 115%);
+    box-shadow: 0 18px 45px rgba(255,90,0,.20); margin-bottom: 20px;
+}
+.hero h1 { font-size: 42px; margin-bottom: 8px; }
+.hero p { font-size: 17px; opacity:.95; max-width: 980px; }
+.card {
+    background: rgba(255,255,255,.88); border: 1px solid rgba(255,90,0,.12);
+    border-radius: 24px; padding: 20px; box-shadow: 0 12px 32px rgba(17,17,17,.07);
+}
+.small-card {
+    background: white; border-left: 6px solid #ff5a00; border-radius: 20px;
+    padding: 18px 20px; box-shadow: 0 8px 24px rgba(17,17,17,.06);
+}
+.badge { display:inline-block; padding:7px 12px; border-radius:999px; background:#111; color:#fff; font-weight:700; }
+.warning-box { background:#fff3e8; border:1px solid #ffbf91; border-radius:18px; padding:16px; }
+.success-box { background:#effaf3; border:1px solid #afe0bd; border-radius:18px; padding:16px; }
+.metric-label { color:#666; font-size:14px; }
+.metric-value { color:#111; font-size:28px; font-weight:800; }
+hr { margin: 1.2rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+CUSTOMER_FEATURES = [
+    "Total_Price_std", "Quantity_std", "Order_Hour_std",
+    "Payment_Method_Encoded", "Traffic_Level_Encoded", "Total_Delivery_Route"
+]
+PERFORMANCE_FEATURES = [
+    "Delivery_Duration_Minutes_std", "Total_Delivery_Route",
+    "Traffic_Level_Encoded", "Driver_Vehicle_Encoded", "Delivery_Hour_std"
+]
+
+PAYMENT_MAP = {"Cash": 0, "Card": 1, "Credit Card": 1, "Wallet": 2}
+TRAFFIC_MAP = {"Low": 0, "Medium": 1, "High": 2}
+VEHICLE_MAP = {"Bicycle": 0, "Bike": 1, "Motorbike": 1, "Car": 2}
+
+CUSTOMER_EVAL = pd.DataFrame({
+    "Model": ["K-Means", "GMM", "DBSCAN"],
+    "Silhouette Score": [0.481242, 0.480522, 0.299869],
+    "Davies-Bouldin Index": [0.695353, np.nan, np.nan],
+    "Calinski-Harabasz Score": [106038.562645, np.nan, np.nan],
+    "Use Case": ["Main model", "Comparison", "Comparison"]
 })
-st.dataframe(pca_df)
-st.write(f"Total Explained Variance: **{result['pca'].explained_variance_ratio_.sum():.2%}**")
+PERF_EVAL = pd.DataFrame({
+    "Model": ["K-Means", "GMM", "DBSCAN"],
+    "Silhouette Score": [0.440408, 0.440370, 0.388977],
+    "Davies-Bouldin Index": [0.782154, np.nan, np.nan],
+    "Calinski-Harabasz Score": [102654.998004, np.nan, np.nan],
+    "Use Case": ["Main model", "Comparison", "Comparison"]
+})
 
-st.subheader("8. Dataset Limitation Analysis")
-for note in limitation_text(evaluation_df, result["pca"]):
-    st.write(f"- {note}")
+CUSTOMER_CLUSTER_INFO = {
+    0: {"name":"Value Regular Customer", "desc":"Pelanggan dengan transaksi relatif stabil dan pola order normal.", "rec":"Berikan voucher ringan, loyalty points, dan rekomendasi menu populer agar repeat order meningkat."},
+    1: {"name":"High Value Customer", "desc":"Pelanggan bernilai tinggi dengan total belanja atau kuantitas lebih besar.", "rec":"Prioritaskan premium promo, bundle hemat, subscription, dan personalized campaign."},
+    2: {"name":"Quick Small Order Customer", "desc":"Pelanggan dengan pembelian kecil dan cenderung praktis/cepat.", "rec":"Tawarkan promo ongkir, quick reorder, dan rekomendasi makanan cepat saji."},
+    3: {"name":"Route-Sensitive Customer", "desc":"Pelanggan yang transaksinya lebih dipengaruhi rute/traffic/waktu order.", "rec":"Optimalkan estimasi waktu, pilih driver terdekat, dan tampilkan transparansi delivery fee."},
+}
+PERF_CLUSTER_INFO = {
+    0: {"name":"Efficient Delivery", "desc":"Durasi dan rute relatif efisien.", "insight":"Pengiriman termasuk baik. Pertahankan alokasi driver dan estimasi waktu seperti saat ini."},
+    1: {"name":"Moderate Delivery", "desc":"Performa normal, tetapi masih punya ruang optimasi.", "insight":"Masih cukup efisien, namun perlu monitoring pada jam sibuk dan area rute panjang."},
+    2: {"name":"Traffic/Route Heavy Delivery", "desc":"Pengiriman cenderung terdampak traffic atau rute yang lebih berat.", "insight":"Kurang efisien jika sering terjadi. Perlu route optimization dan penempatan driver lebih strategis."},
+    3: {"name":"Slow Delivery Risk", "desc":"Durasi tinggi atau kombinasi faktor pengiriman kurang ideal.", "insight":"Perlu perhatian khusus: cek traffic tinggi, kendaraan, jam delivery, dan estimasi waktu ke customer."},
+}
 
-st.subheader("9. Download Result")
-csv_result = clustered_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="Download dataset with cluster labels",
-    data=csv_result,
-    file_name="talabat_cluster_result.csv",
-    mime="text/csv"
-)
+@st.cache_resource
+def load_models():
+    required = {
+        "customer_kmeans": "customer_kmeans.pkl",
+        "customer_scaler": "customer_scaler.pkl",
+        "customer_pca": "customer_pca.pkl",
+        "performance_kmeans": "performance_kmeans.pkl",
+        "performance_scaler": "performance_scaler.pkl",
+        "performance_pca": "performance_pca.pkl",
+    }
+    missing = [name for name in required.values() if not (MODEL_DIR / name).exists()]
+    if missing:
+        st.error("File model belum lengkap. Jalankan `python model_training.py` terlebih dahulu.")
+        st.stop()
+    return {key: joblib.load(MODEL_DIR / filename) for key, filename in required.items()}
+
+@st.cache_data
+def load_sample_data():
+    path = DATA_DIR / "sample_talabat.csv"
+    if path.exists():
+        return pd.read_csv(path)
+    rng = np.random.default_rng(42)
+    n = 500
+    df = pd.DataFrame({
+        "Total_Price": rng.gamma(3, 25, n).round(2),
+        "Quantity": rng.integers(1, 8, n),
+        "Order_Hour": rng.integers(0, 24, n),
+        "Delivery_Hour": rng.integers(0, 24, n),
+        "Delivery_Duration_Minutes": np.clip(rng.normal(38, 10, n), 10, 90).round(1),
+        "Total_Delivery_Route": np.clip(rng.normal(8, 3, n), 1, 22).round(2),
+        "Traffic_Level": rng.choice(["Low", "Medium", "High"], n, p=[.35,.45,.20]),
+        "Payment_Method": rng.choice(["Cash", "Card", "Wallet"], n),
+        "Driver_Vehicle": rng.choice(["Bicycle", "Bike", "Car"], n, p=[.20,.60,.20]),
+    })
+    return df
+
+def hero(title, subtitle):
+    st.markdown(f"""<div class='hero'><h1>{title}</h1><p>{subtitle}</p></div>""", unsafe_allow_html=True)
+
+def metric_card(label, value):
+    st.markdown(f"<div class='small-card'><div class='metric-label'>{label}</div><div class='metric-value'>{value}</div></div>", unsafe_allow_html=True)
+
+def transform_numeric(value, mean, std):
+    return (value - mean) / std if std else 0
+
+def predict_customer(models, total_price, quantity, order_hour, payment, traffic, route):
+    # Notebook memakai fitur *_std untuk Total Price, Quantity, dan Order Hour.
+    # Mean/std berikut disimpan di scaler model_training sebagai training statistics.
+    stats = getattr(models["customer_scaler"], "raw_stats_", {})
+    row = pd.DataFrame([{
+        "Total_Price_std": transform_numeric(total_price, stats.get("Total_Price_mean", 75), stats.get("Total_Price_std", 45)),
+        "Quantity_std": transform_numeric(quantity, stats.get("Quantity_mean", 3), stats.get("Quantity_std", 1.8)),
+        "Order_Hour_std": transform_numeric(order_hour, stats.get("Order_Hour_mean", 13), stats.get("Order_Hour_std", 6)),
+        "Payment_Method_Encoded": PAYMENT_MAP[payment],
+        "Traffic_Level_Encoded": TRAFFIC_MAP[traffic],
+        "Total_Delivery_Route": route,
+    }], columns=CUSTOMER_FEATURES)
+    scaled = models["customer_scaler"].transform(row)
+    pca_point = models["customer_pca"].transform(scaled)
+    cluster = int(models["customer_kmeans"].predict(pca_point)[0])
+    return cluster, pca_point
+
+def predict_performance(models, duration, route, traffic, vehicle, delivery_hour):
+    stats = getattr(models["performance_scaler"], "raw_stats_", {})
+    row = pd.DataFrame([{
+        "Delivery_Duration_Minutes_std": transform_numeric(duration, stats.get("Delivery_Duration_Minutes_mean", 38), stats.get("Delivery_Duration_Minutes_std", 10)),
+        "Total_Delivery_Route": route,
+        "Traffic_Level_Encoded": TRAFFIC_MAP[traffic],
+        "Driver_Vehicle_Encoded": VEHICLE_MAP[vehicle],
+        "Delivery_Hour_std": transform_numeric(delivery_hour, stats.get("Delivery_Hour_mean", 13), stats.get("Delivery_Hour_std", 6)),
+    }], columns=PERFORMANCE_FEATURES)
+    scaled = models["performance_scaler"].transform(row)
+    pca_point = models["performance_pca"].transform(scaled)
+    cluster = int(models["performance_kmeans"].predict(pca_point)[0])
+    return cluster, pca_point
+
+def home_page(df):
+    hero("🛵 Talabat Delivery Intelligence Dashboard", "Dashboard interaktif untuk customer segmentation dan delivery performance clustering menggunakan K-Means sebagai model utama. Dibuat dengan Streamlit, Plotly, PCA, dan machine learning pipeline yang siap deploy.")
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: metric_card("Total Data", f"{len(df):,}")
+    with c2: metric_card("Jumlah Fitur Utama", "11")
+    with c3: metric_card("Best Model", "K-Means")
+    with c4: metric_card("Best Silhouette", "0.481242")
+    st.markdown("### 🎯 Fokus Project")
+    st.markdown("""
+    <div class='card'>
+    Aplikasi ini membantu membaca pola pelanggan dan performa pengiriman. Customer segmentation digunakan untuk memahami tipe customer, sedangkan delivery performance clustering digunakan untuk menilai apakah proses pengiriman sudah efisien atau perlu optimasi.
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("### 📌 Regression Note")
+    st.markdown("<div class='warning-box'>⚠️ XGBoost Tuned Regression hanya dijadikan fitur tambahan karena R² = <b>0.1099</b>. Artinya model regression belum kuat untuk prediksi durasi secara akurat.</div>", unsafe_allow_html=True)
+
+def customer_page(models):
+    hero("👥 Customer Segmentation", "Masukkan data transaksi customer. Sistem akan melakukan encoding → scaling → PCA transform → K-Means prediction.")
+    left, right = st.columns([1,1.15])
+    with left:
+        st.markdown("### Input Customer")
+        total_price = st.number_input("Total Price", 1.0, 1000.0, 75.0, 1.0)
+        quantity = st.number_input("Quantity", 1, 50, 3)
+        order_hour = st.slider("Order Hour", 0, 23, 13)
+        payment = st.selectbox("Payment Method", ["Cash", "Card", "Wallet"])
+        traffic = st.selectbox("Traffic Level", ["Low", "Medium", "High"])
+        route = st.number_input("Total Delivery Route (km)", 0.1, 100.0, 8.0, 0.1)
+        run = st.button("Predict Customer Cluster 🚀", use_container_width=True)
+    with right:
+        if run:
+            cluster, pca_point = predict_customer(models,total_price,quantity,order_hour,payment,traffic,route)
+            info = CUSTOMER_CLUSTER_INFO.get(cluster, CUSTOMER_CLUSTER_INFO[0])
+            st.markdown(f"<div class='card'><span class='badge'>Cluster {cluster}</span><h2>{info['name']}</h2><p>{info['desc']}</p><hr><b>Business Recommendation:</b><br>{info['rec']}</div>", unsafe_allow_html=True)
+            fig = go.Figure()
+            centers = models["customer_kmeans"].cluster_centers_
+            fig.add_trace(go.Scatter(x=centers[:,0], y=centers[:,1], mode='markers+text', text=[f'C{i}' for i in range(len(centers))], marker=dict(size=18), name='Centroids'))
+            fig.add_trace(go.Scatter(x=[pca_point[0,0]], y=[pca_point[0,1]], mode='markers', marker=dict(size=22), name='New Input'))
+            fig.update_layout(title="PCA Position vs K-Means Centroids", template="plotly_white", height=420)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Isi input di kiri, lalu klik tombol predict.")
+
+def performance_page(models):
+    hero("⚡ Delivery Performance Clustering", "Analisis apakah pengiriman tergolong efisien, sedang, terdampak traffic/rute, atau berisiko lambat.")
+    left, right = st.columns([1,1.15])
+    with left:
+        duration = st.number_input("Delivery Duration Minutes", 1.0, 180.0, 38.0, 0.5)
+        route = st.number_input("Total Delivery Route (km)", 0.1, 100.0, 8.0, 0.1)
+        traffic = st.selectbox("Traffic Level", ["Low", "Medium", "High"], key="perf_traffic")
+        vehicle = st.selectbox("Driver Vehicle", ["Bicycle", "Bike", "Car"])
+        delivery_hour = st.slider("Delivery Hour", 0, 23, 14)
+        run = st.button("Predict Performance Cluster ⚡", use_container_width=True)
+    with right:
+        if run:
+            cluster, pca_point = predict_performance(models,duration,route,traffic,vehicle,delivery_hour)
+            info = PERF_CLUSTER_INFO.get(cluster, PERF_CLUSTER_INFO[0])
+            box = "success-box" if cluster in [0,1] else "warning-box"
+            st.markdown(f"<div class='{box}'><span class='badge'>Performance Cluster {cluster}</span><h2>{info['name']}</h2><p>{info['desc']}</p><hr><b>Insight:</b><br>{info['insight']}</div>", unsafe_allow_html=True)
+            fig = go.Figure()
+            centers = models["performance_kmeans"].cluster_centers_
+            fig.add_trace(go.Scatter(x=centers[:,0], y=centers[:,1], mode='markers+text', text=[f'C{i}' for i in range(len(centers))], marker=dict(size=18), name='Centroids'))
+            fig.add_trace(go.Scatter(x=[pca_point[0,0]], y=[pca_point[0,1]], mode='markers', marker=dict(size=22), name='New Input'))
+            fig.update_layout(title="PCA Position vs Performance Centroids", template="plotly_white", height=420)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Masukkan kondisi pengiriman lalu klik predict.")
+
+def evaluation_page():
+    hero("📊 Model Evaluation", "Perbandingan K-Means, GMM, dan DBSCAN berdasarkan hasil evaluasi notebook.")
+    tab1, tab2 = st.tabs(["Customer Segmentation", "Delivery Performance"])
+    for tab, df_eval, title in [(tab1, CUSTOMER_EVAL, "Customer"), (tab2, PERF_EVAL, "Performance")]:
+        with tab:
+            st.dataframe(df_eval, use_container_width=True)
+            fig1 = px.bar(df_eval, x="Model", y="Silhouette Score", text="Silhouette Score", title=f"{title} - Silhouette Score", template="plotly_white")
+            fig1.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+            st.plotly_chart(fig1, use_container_width=True)
+            dbi_df = df_eval.dropna(subset=["Davies-Bouldin Index"])
+            fig2 = px.bar(dbi_df, x="Model", y="Davies-Bouldin Index", text="Davies-Bouldin Index", title=f"{title} - Davies-Bouldin Index", template="plotly_white")
+            fig2.update_traces(texttemplate='%{text:.3f}', textposition='outside')
+            st.plotly_chart(fig2, use_container_width=True)
+    st.markdown("### Kenapa K-Means Dipilih?")
+    st.markdown("<div class='card'>K-Means dipilih karena menghasilkan Silhouette Score tertinggi atau hampir sama dengan GMM, hasil cluster lebih stabil, mudah diinterpretasikan, dan cocok untuk dashboard segmentasi bisnis. DBSCAN kurang cocok karena score lebih rendah dan sensitif terhadap parameter eps/min_samples, sehingga sebagian data dapat dianggap noise.</div>", unsafe_allow_html=True)
+
+def insight_page(df):
+    hero("🔎 Data Insight", "Preview data, distribusi numerik, korelasi, dan limitasi dataset.")
+    st.markdown("### Sample Dataset")
+    st.dataframe(df.head(20), use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.histogram(df, x="Total_Price", nbins=35, title="Distribusi Total Price", template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.histogram(df, x="Delivery_Duration_Minutes", nbins=35, title="Distribusi Delivery Duration", template="plotly_white")
+        st.plotly_chart(fig, use_container_width=True)
+    numeric_cols = ["Total_Price", "Quantity", "Order_Hour", "Delivery_Hour", "Delivery_Duration_Minutes", "Total_Delivery_Route"]
+    corr = df[numeric_cols].corr(numeric_only=True)
+    fig = px.imshow(corr, text_auto=True, title="Correlation Heatmap", template="plotly_white", aspect="auto")
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("### Limitasi Dataset")
+    st.markdown("""
+    <div class='warning-box'>
+    <b>1.</b> Korelasi fitur terhadap delivery duration cenderung lemah, sehingga regression memiliki R² rendah.<br>
+    <b>2.</b> Clustering menggunakan PCA 2D, sehingga sebagian informasi dari fitur asli dapat berkurang.<br>
+    <b>3.</b> Dataset belum tentu menangkap faktor eksternal seperti cuaca, promo, kepadatan restoran, dan real-time traffic.<br>
+    <b>4.</b> Label cluster bukan label aktual, melainkan hasil pengelompokan unsupervised sehingga interpretasinya perlu validasi bisnis.
+    </div>
+    """, unsafe_allow_html=True)
+
+def about_page():
+    hero("ℹ️ About", "Ringkasan metode, kesimpulan, dan batasan aplikasi.")
+    st.markdown("""
+    <div class='card'>
+    <h3>Metode</h3>
+    Aplikasi menggunakan K-Means untuk dua task utama: customer segmentation dan delivery performance clustering. Input user diproses melalui encoding, standardization, PCA transform, lalu prediksi cluster.
+    <h3>Kesimpulan</h3>
+    K-Means menjadi model utama karena evaluasi clustering paling kuat dan interpretasinya paling cocok untuk dashboard bisnis.
+    <h3>Limitasi</h3>
+    Regression XGBoost tuned hanya tambahan karena R² 0.1099 masih rendah. Aplikasi ini lebih tepat dipakai sebagai decision support dan exploratory dashboard, bukan sistem prediksi durasi yang sepenuhnya akurat.
+    </div>
+    """, unsafe_allow_html=True)
+
+models = load_models()
+df = load_sample_data()
+
+st.sidebar.markdown("# 🧡 Talabat ML")
+page = st.sidebar.radio("Navigation", ["Home", "Customer Segmentation", "Delivery Performance", "Model Evaluation", "Data Insight", "About"])
+st.sidebar.markdown("---")
+st.sidebar.caption("Built for Streamlit Community Cloud")
+
+if page == "Home": home_page(df)
+elif page == "Customer Segmentation": customer_page(models)
+elif page == "Delivery Performance": performance_page(models)
+elif page == "Model Evaluation": evaluation_page()
+elif page == "Data Insight": insight_page(df)
+else: about_page()
